@@ -6,7 +6,11 @@ from __future__ import annotations
 
 from typing import Any
 
+from datetime import datetime, timezone
+
+from app.quality_data import DOWNSTREAM_ROWS, downstream_rows
 from app.services.base import BaseModuleService
+from app.services.quality_engine import apply_rule_result, evaluate_rule_rows, rule_enabled
 from app.store import store
 
 
@@ -22,41 +26,66 @@ class DataQualityRuleService(BaseModuleService):
 
     VALID_DIMENSIONS = frozenset({"completeness", "uniqueness", "accuracy", "consistency", "timeliness"})
 
+    def create_entry(self, values: dict[str, Any]):
+        """登记规则后，把该目标表补进本轮仍可领取的复查批次。"""
+        entry, missing = super().create_entry(values)
+        if entry is not None:
+            from app.services.quality_batch import quality_batches
+
+            entry["补检批次"] = quality_batches.on_rule_registered(entry)
+        return entry, missing
+
+    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
+        """执行校验时读取目标表实际分区行，不用固定样例顶替结论。"""
+        if action != "执行校验":
+            return super().run_action(entry_id, action)
+        result = self.execute_validation(entry_id)
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None or not result.get("ok"):
+            return None, result.get("message", "质量规则不存在")
+        return entry, result["conclusion"]
+
     def execute_validation(self, entry_id: int) -> dict[str, Any]:
         """执行数据质量校验并返回详细结果。
 
-        根据校验维度执行对应的质量检查，返回行级和字段级的校验明细。
-        校验结果同步写入 data_lake_audit 模块作为审计证据。
+        只对目标表有实际行的分区下结论；目标表没有落盘行时直接判未通过，
+        不能拿上游正常或样例数据代替下游检查。
         """
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
             return {"ok": False, "message": "质量规则不存在"}
+        if not rule_enabled(entry):
+            return {"ok": False, "message": f"规则「{entry.get('规则名称')}」已停用，未读取数据"}
 
         dimension = entry.get("校验维度", "")
         target_table = entry.get("目标表", "")
-        threshold = float(entry.get("阈值", "0.95"))
+        threshold = float(entry.get("阈值", "0.95") or 0.0)
+        partitions = sorted(DOWNSTREAM_ROWS.get(target_table, {}), reverse=True)
+        if not partitions:
+            return {"ok": False, "message": f"目标表 {target_table} 没有可校验的实际分区数据"}
 
-        checks = self._run_dimension_checks(dimension, target_table)
-        score = sum(c["passed"] for c in checks) / max(len(checks), 1)
-        passed = score >= threshold
-
-        entry["最近分数"] = str(round(score, 4))
-        entry["status"] = "已通过" if passed else "未通过"
-        if not passed:
-            entry["abnormal"] = True
-
+        partition = partitions[0]
+        rows = downstream_rows(target_table, partition)
+        result = evaluate_rule_rows(
+            entry, rows, downstream_table=target_table, partition=partition)
+        apply_rule_result(
+            entry, result, downstream_table=target_table, partition=partition,
+            round_no=0, batch_no=0, checked_at=datetime.now(timezone.utc).replace(
+                microsecond=0).isoformat().replace("+00:00", "Z"),
+        )
         return {
             "ok": True,
             "rule_id": entry_id,
             "rule_name": entry.get("规则名称"),
             "dimension": dimension,
             "target_table": target_table,
+            "partition": partition,
             "threshold": threshold,
-            "score": round(score, 4),
-            "passed": passed,
-            "checks": checks,
-            "total_rows_checked": 1520000,
-            "failed_rows": sum(not c["passed"] for c in checks) * 15000,
+            "score": result["score"],
+            "passed": result["passed"],
+            "rows_checked": result["rows_checked"],
+            "failed_rows": result["failed_rows"],
+            "conclusion": result["conclusion"],
         }
 
     def check_lineage_affected_rules(self, target_table: str) -> dict[str, Any]:
@@ -102,7 +131,7 @@ class DataQualityRuleService(BaseModuleService):
         for rule in module_rules:
             result = self.execute_validation(rule["id"])
             results.append(result)
-            if result["passed"]:
+            if result.get("passed"):
                 passed_count += 1
 
         return {

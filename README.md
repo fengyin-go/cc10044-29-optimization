@@ -71,6 +71,24 @@ npm run dev
 | 清理作业 | `cleanup_job` | 清理作业 | 作业名称、目标路径、清理条件 |
 | 目录同步 | `catalog_sync` | 同步任务 | 任务名称、源Catalog、目标Catalog |
 
+## 批量质量校验与断点续做
+
+值班员从「批量质量校验」页面（`/quality-batch`）操作，也可直接调后端接口：
+
+1. `GET /api/quality/source-partitions`：从源表实际分区里选一个待检分区。
+2. `POST /api/quality/submit`：一次提交一个源表分区，按已建立血缘排出读取该
+   源表的下游表；没有启用检查项的表不进本批，停用规则不读取数据。
+3. `POST /api/quality/batches/claim-next` 或 `GET /api/quality/impact/{血缘条目}`：
+   领取尚未完成的整组检查。血缘或规则登记迟到时，新下游/新规则会补进本轮
+   还没结案的待领取批次，已核过的表不会被重复排入。
+4. `POST /api/quality/batches/{批次}/claim` + `/execute`：必须按实际领到的批次
+   执行，每条结论定位到下游分区、规则、检查行号和失败行。
+5. `POST /api/quality/rounds/{轮次}/close`：全部批次完成后结案；
+   `GET /api/quality/rounds/{轮次}` 回查逐表结论、已核行、重复校验和血缘回填。
+
+源表正常不能证明下游正常：下游分区没有实际行时该检查直接判未通过。
+逐表结论会回填到 `data_quality_rule` 的最近分数和 `lineage_graph` 的质量状态。
+
 ## 约定
 
 - 全部模块共享`frontend/src/views/WorkbenchView.vue|tsx`和一套资源路由。

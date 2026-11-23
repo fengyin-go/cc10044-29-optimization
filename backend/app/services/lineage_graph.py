@@ -20,6 +20,17 @@ class LineageGraphService(BaseModuleService):
     ACTION_RULES = {"刷新血缘": "已建立", "标记断裂": "已断裂"}
     NEGATIVE_ACTIONS = []
 
+    def create_entry(self, values: dict[str, Any]):
+        """登记血缘；新下游要在本轮结案前补进可领用的复查批次。"""
+        entry, missing = super().create_entry(values)
+        if entry is not None:
+            from app.services.quality_batch import quality_batches
+
+            entry["补检批次"] = quality_batches.on_lineage_registered(entry)
+            if entry["补检批次"]:
+                entry["待复查"] = True
+        return entry, missing
+
     def trace_upstream(self, target_table: str, max_depth: int = 5) -> dict[str, Any]:
         """从目标表向上追溯所有上游来源表和转换链路。
 
